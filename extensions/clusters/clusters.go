@@ -21,6 +21,7 @@ import (
 	"github.com/rancher/shepherd/pkg/wait"
 	"github.com/rancher/wrangler/pkg/summary"
 	"github.com/sirupsen/logrus"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -161,36 +162,25 @@ func CreateK3SRKE2Cluster(client *rancher.Client, rke2Cluster *apisV1.Cluster) (
 			return err
 		}
 
-		watchInterface, err := provKubeClient.Clusters(cluster.ObjectMeta.Namespace).Watch(context.TODO(), metav1.ListOptions{
-			FieldSelector:  "metadata.name=" + cluster.ObjectMeta.Name,
-			TimeoutSeconds: &defaults.WatchTimeoutSeconds,
-		})
-		if err != nil {
+		err = provKubeClient.Clusters(cluster.ObjectMeta.Namespace).Delete(context.TODO(), cluster.ObjectMeta.Name, metav1.DeleteOptions{})
+		if err != nil && !k8serrors.IsNotFound(err) {
 			return err
 		}
 
-		client, err = client.ReLogin()
-		if err != nil {
-			return err
-		}
+		ctx, cancel := context.WithTimeout(context.Background(), defaults.TenMinuteTimeout)
+		defer cancel()
 
-		err = client.Steve.SteveType(stevetypes.Provisioning).Delete(cluster)
-		if err != nil {
-			return err
-		}
-
-		return wait.WatchWait(watchInterface, func(event watch.Event) (ready bool, err error) {
-			cluster := event.Object.(*apisV1.Cluster)
-			if event.Type == watch.Error {
-				return false, fmt.Errorf("there was an error deleting cluster")
-			} else if event.Type == watch.Deleted {
+		return kwait.PollUntilContextCancel(ctx, 5*time.Second, true, func(ctx context.Context) (bool, error) {
+			_, getErr := provKubeClient.Clusters(cluster.ObjectMeta.Namespace).Get(ctx, cluster.ObjectMeta.Name, metav1.GetOptions{})
+			if k8serrors.IsNotFound(getErr) {
 				return true, nil
-			} else if cluster == nil {
-				return true, nil
+			}
+			if getErr != nil {
+				logrus.Debugf("[%s/%s] error checking cluster deletion, retrying: %v", cluster.ObjectMeta.Namespace, cluster.ObjectMeta.Name, getErr)
 			}
 			return false, nil
 		})
-	})
+})
 
 	return cluster, nil
 }
